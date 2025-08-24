@@ -1,77 +1,76 @@
-import csv
-try:
-    from urllib.request import urlretrieve
-except ImportError:
-    from urllib import urlretrieve
+import numpy as np
+import pandas as pd
+from sklearn.metrics import log_loss
 
-class Util:
+def brier_score(y_true: np.ndarray, p: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    p = np.asarray(p, dtype=float)
+    return float(np.mean((p - y_true) ** 2))
 
-    @staticmethod
-    def read_games(file):
-        """ Initializes game objects from csv """
-        games = [item for item in csv.DictReader(open(file))]
+def accuracy_at_thresh(y_true: np.ndarray, p: np.ndarray, thresh: float = 0.5) -> float:
+    y_pred = (p >= thresh).astype(int)
+    return float(np.mean(y_pred == y_true))
 
-        # Uncommenting these three lines will grab the latest game results for this season, update team ratings accordingly, and make forecasts for upcoming games
-        #file_latest = file.replace(".", "_2021.")
-        #urlretrieve("https://projects.fivethirtyeight.com/nfl-api/2021/nfl_games_2021.csv", file_latest)
-        #games += [item for item in csv.DictReader(open(file_latest))]
+def expected_calibration_error(y_true: np.ndarray, p: np.ndarray, n_bins: int = 15) -> tuple[float, pd.DataFrame]:
+    y = np.asarray(y_true).astype(int)
+    p = np.asarray(p).astype(float)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.digitize(p, bins) - 1
+    idx = np.clip(idx, 0, n_bins - 1)
 
-        for game in games:
-            game['season'], game['neutral'], game['playoff'] = int(game['season']), int(game['neutral']), int(game['playoff'])
-            game['score1'], game['score2'] = int(game['score1']) if game['score1'] != '' else None, int(game['score2']) if game['score2'] != '' else None
-            game['elo_prob1'], game['result1'] = float(game['elo_prob1']) if game['elo_prob1'] != '' else None, float(game['result1']) if game['result1'] != '' else None
+    rows = []
+    total_n = len(y)
+    ece = 0.0
+    for b in range(n_bins):
+        mask = idx == b
+        n = int(np.sum(mask))
+        if n == 0:
+            rows.append((bins[b], bins[b+1], n, np.nan, np.nan))
+            continue
+        conf = float(np.mean(p[mask]))
+        acc = float(np.mean(y[mask]))
+        weight = n / total_n
+        ece += weight * abs(acc - conf)
+        rows.append((bins[b], bins[b+1], n, conf, acc))
 
-        return games
+    calib_df = pd.DataFrame(rows, columns=["bin_lo","bin_hi","n","mean_confidence","empirical_accuracy"])
+    return float(ece), calib_df
 
-    @staticmethod
-    def evaluate_forecasts(games):
-        """ Evaluates and scores forecasts in the my_prob1 field against those in the elo_prob1 field for each game """
-        my_points_by_season, elo_points_by_season = {}, {}
+def decile_lift_table(y_true: np.ndarray, p: np.ndarray, k: int = 10) -> pd.DataFrame:
+    df = pd.DataFrame({"y": y_true, "p": p})
+    df = df.sort_values("p", ascending=False).reset_index(drop=True)
+    n = len(df)
+    rows = []
+    base_rate = df["y"].mean() if n > 0 else np.nan
+    for i in range(k):
+        lo = int(i * n / k)
+        hi = int((i + 1) * n / k)
+        chunk = df.iloc[lo:hi]
+        if len(chunk) == 0:
+            rows.append((i+1, lo, hi, np.nan, np.nan))
+            continue
+        avg_p = float(chunk["p"].mean())
+        acc = float((chunk["y"] == (chunk["p"] >= 0.5).astype(int)).mean())
+        lift = (acc / base_rate) if (base_rate and not np.isnan(base_rate) and base_rate > 0) else np.nan
+        rows.append((i+1, lo, hi, avg_p, acc, lift))
+    return pd.DataFrame(rows, columns=["decile","start_idx","end_idx","avg_pred","acc@0.5","lift_vs_base_rate"])
 
-        forecasted_games = [g for g in games if g['result1'] != None]
-        upcoming_games = [g for g in games if g['result1'] == None and 'my_prob1' in g]
+def bootstrap_metric_ci(y_true: np.ndarray, p: np.ndarray, fn, n_boot: int = 1000, seed: int = 42) -> tuple[float, tuple[float, float]]:
+    rng = np.random.default_rng(seed)
+    y = np.asarray(y_true).astype(int)
+    pr = np.asarray(p).astype(float)
+    n = len(y)
+    stat = fn(y, pr)
+    if n == 0:
+        return np.nan, (np.nan, np.nan)
+    boots = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        boots.append(fn(y[idx], pr[idx]))
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    return float(stat), (float(lo), float(hi))
 
-        # Evaluate forecasts and group by season
-        for game in forecasted_games:
-
-            # Skip unplayed games and ties
-            if game['result1'] == None or game['result1'] == 0.5:
-                continue
-
-            if game['season'] not in elo_points_by_season:
-                elo_points_by_season[game['season']] = 0.0
-                my_points_by_season[game['season']] = 0.0
-
-            # Calculate elo's points for game
-            rounded_elo_prob = round(game['elo_prob1'], 2)
-            elo_brier = (rounded_elo_prob - game['result1']) * (rounded_elo_prob - game['result1'])
-            elo_points = 25 - (100 * elo_brier)
-            elo_points = round(elo_points + 0.001 if elo_points < 0 else elo_points, 1) # Round half up
-            if game['playoff'] == 1:
-                elo_points *= 2
-            elo_points_by_season[game['season']] += elo_points
-
-            # Calculate my points for game
-            rounded_my_prob = round(game['my_prob1'], 2)
-            my_brier = (rounded_my_prob - game['result1']) * (rounded_my_prob - game['result1'])
-            my_points = 25 - (100 * my_brier)
-            my_points = round(my_points + 0.001 if my_points < 0 else my_points, 1) # Round half up
-            if game['playoff'] == 1:
-                my_points *= 2
-            my_points_by_season[game['season']] += my_points
-
-        # Print individual seasons
-        for season in my_points_by_season:
-            print("In %s, your forecasts would have gotten %s points. Elo got %s points." % (season, round(my_points_by_season[season], 2), round(elo_points_by_season[season], 2)))
-
-        # Show overall performance
-        my_avg = sum(my_points_by_season.values())/len(my_points_by_season.values())
-        elo_avg = sum(elo_points_by_season.values())/len(elo_points_by_season.values())
-        print("\nOn average, your forecasts would have gotten %s points per season. Elo got %s points per season.\n" % (round(my_avg, 2), round(elo_avg, 2)))
-
-        # Print forecasts for upcoming games
-        if len(upcoming_games) > 0:
-            print("Forecasts for upcoming games:")
-            for game in upcoming_games:
-                print("%s\t%s vs. %s\t\t%s%% (Elo)\t\t%s%% (You)" % (game['date'], game['team1'], game['team2'], int(round(100*game['elo_prob1'])), int(round(100*game['my_prob1']))))
-            print("")
+def safe_log_loss(y_true: np.ndarray, p: np.ndarray) -> float:
+    eps = 1e-15
+    p = np.clip(p, eps, 1 - eps)
+    return log_loss(y_true, p, labels=[0,1])
